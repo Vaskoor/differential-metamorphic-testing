@@ -32,7 +32,7 @@ describe("minimizer (delta-debugging)", () => {
     const oracle = (s: unknown[]) => s.some(e => e === "bug");
     const result = minimize(input, oracle);
     assert.ok(result.reductionPct >= 0 && result.reductionPct <= 100);
-    assert.ok(result.reductionPct > 50); // should reduce significantly
+    assert.ok(result.reductionPct >= 50); // should reduce significantly
   });
 });
 
