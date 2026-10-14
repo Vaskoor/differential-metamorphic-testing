@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  postgres-a:
+    image: postgres:16.4
+    ports: ["5432:5432"]
+    environment: { POSTGRES_DB: target_a, POSTGRES_USER: qa, POSTGRES_PASSWORD: qa }
+  postgres-b:
+    image: postgres:17.0
+    ports: ["5433:5432"]
+    environment: { POSTGRES_DB: target_b, POSTGRES_USER: qa, POSTGRES_PASSWORD: qa }
+  jq:
+    image: ghcr.io/jqlang/jq:1.7
+    entrypoint: ["sleep", "3600"]

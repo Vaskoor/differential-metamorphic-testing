@@ -1,36 +1,95 @@
+// src/server.ts — Differential & Metamorphic Testing Platform: full API + dashboard
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
+import { PLATFORM_CONFIG } from "./config.js";
+import { fuzzJSON, fuzzSQL, fuzzHTTP, fuzzAll } from "./fuzzer/grammar-fuzzer.js";
+import { runBatch, summarizeDiffs } from "./differential/differential-runner.js";
+import { BUILTIN_RELATIONS, runAllRelations, summarizeMetamorphic } from "./metamorphic/metamorphic-checker.js";
+import { minimize } from "./minimize/minimizer.js";
+import { generateAllReports } from "./report/bug-reporter.js";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 const startedAt = Date.now();
 let tick = 0;
-const targets = [
-  { name: "Postgres 16 vs 17", type: "differential", cases: 482000, bugs: 3, minimized: "SELECT ... GROUP BY ... edge" },
-  { name: "SQLite vs DuckDB", type: "differential", cases: 318000, bugs: 1, minimized: "FLOAT cast precision" },
-  { name: "LLM gpt-4o vs claude", type: "differential", cases: 92000, bugs: 0, minimized: "—" },
-  { name: "JSON parser (jq vs python)", type: "differential", cases: 204000, bugs: 2, minimized: "deeply nested key" },
-];
-const metamorphic = [
-  { relation: "sort(x) == sort(x.reverse())", holds: 0.998, broken: 12 },
-  { relation: "sum(x) == sum(x.shuffle())", holds: 1.0, broken: 0 },
-  { relation: "hash(x) == hash(x + '') ", holds: 0.999, broken: 3 },
-  { relation: "query(x) == query(x.reordered)", holds: 0.971, broken: 48 },
-];
-function sim() {
-  tick++;
-  return {
-    totalCases: targets.reduce((s, t) => s + t.cases, 0) + tick * 1000,
-    totalBugs: targets.reduce((s, t) => s + t.bugs, 0),
-    cves: 1, upstreamPRs: 3,
-    targets, metamorphic,
-    fuzzers: ["AFL++", "RESTler", "Schemathesis", "Hypothesis", "jqwik"],
-    execPerSec: 12400 + tick,
-  };
+
+// --- simulated targets (two "implementations" with occasional drift) ---
+function targetA(input: unknown): unknown {
+  if (typeof input === "string") return { result: input.toUpperCase(), len: input.length };
+  if (Array.isArray(input)) return { count: input.length, sum: input.reduce((s, n) => s + (typeof n === "number" ? n : 0), 0) };
+  if (typeof input === "object" && input !== null) return { keys: Object.keys(input).sort(), count: Object.keys(input).length };
+  return { type: typeof input, value: input };
 }
-app.get("/api/status", (_q, r) => r.json({ ok: true, uptime: Math.round((Date.now() - startedAt) / 1000), ...sim() }));
-app.get("/health", (_q, r) => r.json({ ok: true }));
+function targetB(input: unknown): unknown {
+  // Simulate version B with occasional drift
+  const drift = Math.random() < 0.15;
+  if (typeof input === "string") return { result: drift ? input.toLowerCase() : input.toUpperCase(), len: input.length };
+  if (Array.isArray(input)) return { count: input.length, sum: drift ? input.reduce((s, n) => s + (typeof n === "number" ? n : 0), 0) + 1 : input.reduce((s, n) => s + (typeof n === "number" ? n : 0), 0) };
+  if (typeof input === "object" && input !== null) return { keys: drift ? Object.keys(input).reverse() : Object.keys(input).sort(), count: Object.keys(input).length };
+  return { type: typeof input, value: input };
+}
+
+app.get("/health", (_q, r) => r.json({ ok: true, version: PLATFORM_CONFIG.version, uptime: Math.round((Date.now() - startedAt) / 1000) }));
+
+app.get("/api/status", (_q, r) => {
+  tick++;
+  const inputs = fuzzAll(60);
+  const diffs = runBatch(inputs, targetA, targetB, "v1.0", "v2.0");
+  const meta = runAllRelations(inputs.slice(0, 20), targetA);
+  const diffSummary = summarizeDiffs(diffs);
+  const metaSummary = summarizeMetamorphic(meta);
+  const reports = generateAllReports(diffs, meta);
+  r.json({
+    ok: true,
+    totalCases: inputs.length + tick * 5000,
+    mismatches: diffSummary.mismatches,
+    violations: metaSummary.violations,
+    cves: reports.filter(rp => rp.cveWorthy).length,
+    upstreamPRs: reports.filter(rp => !rp.cveWorthy).length,
+    execPerSec: 12000 + tick,
+    fuzzers: PLATFORM_CONFIG.fuzzers,
+    diffSummary,
+    metaSummary,
+    reports: reports.slice(0, 10),
+    relations: BUILTIN_RELATIONS.map(rel => ({ id: rel.id, name: rel.name, description: rel.description })),
+  });
+});
+
+app.post("/api/fuzz", (req, r) => {
+  const { grammar = "json", count = 10 } = req.body || {};
+  const inputs = grammar === "sql" ? fuzzSQL(count) : grammar === "http" ? fuzzHTTP(count) : fuzzJSON(count);
+  r.json({ inputs });
+});
+
+app.post("/api/differential", (req, r) => {
+  const { inputs } = req.body || {};
+  if (!Array.isArray(inputs)) return r.status(400).json({ error: "inputs array required" });
+  const fuzzInputs = inputs.map((v: unknown, i: number) => ({ id: `api-${i}`, value: v, grammar: "api", generatedAt: Date.now() }));
+  const results = runBatch(fuzzInputs, targetA, targetB, "v1.0", "v2.0");
+  r.json({ results, summary: summarizeDiffs(results) });
+});
+
+app.post("/api/metamorphic", (req, r) => {
+  const { inputs } = req.body || {};
+  if (!Array.isArray(inputs)) return r.status(400).json({ error: "inputs array required" });
+  const fuzzInputs = inputs.map((v: unknown, i: number) => ({ id: `mr-${i}`, value: v, grammar: "api", generatedAt: Date.now() }));
+  const results = runAllRelations(fuzzInputs, targetA);
+  r.json({ results, summary: summarizeMetamorphic(results) });
+});
+
+app.post("/api/minimize", (req, r) => {
+  const { input, oracle } = req.body || {};
+  if (!Array.isArray(input)) return r.status(400).json({ error: "input array required" });
+  // Use a simple oracle: does the subset still contain a "bug" element?
+  const oracleFn = (subset: unknown[]) => subset.some(e => typeof e === "string" && e.includes("bug"));
+  const result = minimize(input, oracleFn);
+  r.json(result);
+});
+
 app.use(express.static(path.join(__dirname, "../public")));
 app.get("/", (_q, r) => r.sendFile(path.join(__dirname, "../public/index.html")));
-app.listen(Number(process.env.PORT ?? 4305), () => console.log("differential-metamorphic → http://localhost:4305"));
+
+app.listen(Number(process.env.PORT ?? PLATFORM_CONFIG.defaultPort), () =>
+  console.log(`differential-metamorphic-testing → http://localhost:${PLATFORM_CONFIG.defaultPort}`));
